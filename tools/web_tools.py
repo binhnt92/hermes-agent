@@ -448,8 +448,30 @@ def _extract_scrape_payload(scrape_result: Any) -> Dict[str, Any]:
 
 DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
 
-_aux_async_client, _DEFAULT_SUMMARIZER_MODEL = get_async_text_auxiliary_client("web_extract")
-DEFAULT_SUMMARIZER_MODEL = os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or _DEFAULT_SUMMARIZER_MODEL
+def _is_nous_auxiliary_client(client: Any) -> bool:
+    """Return True when the resolved auxiliary backend is Nous Portal."""
+    base_url = str(getattr(client, "base_url", "") or "").lower()
+    return "nousresearch.com" in base_url
+
+
+def _resolve_web_extract_auxiliary(model: Optional[str] = None) -> tuple[Optional[Any], Optional[str], Dict[str, Any]]:
+    """Resolve the current web-extract auxiliary client, model, and extra body."""
+    client, default_model = get_async_text_auxiliary_client("web_extract")
+    configured_model = os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip()
+    effective_model = model or configured_model or default_model
+
+    extra_body: Dict[str, Any] = {}
+    if client is not None and _is_nous_auxiliary_client(client):
+        from agent.auxiliary_client import get_auxiliary_extra_body
+        extra_body = get_auxiliary_extra_body() or {"tags": ["product=hermes-agent"]}
+
+    return client, effective_model, extra_body
+
+
+def _get_default_summarizer_model() -> Optional[str]:
+    """Return the current default model for web extraction summarization."""
+    _, model, _ = _resolve_web_extract_auxiliary()
+    return model
 
 _debug = DebugSession("web_tools", env_var="WEB_TOOLS_DEBUG")
 
@@ -458,7 +480,7 @@ async def process_content_with_llm(
     content: str, 
     url: str = "", 
     title: str = "",
-    model: str = DEFAULT_SUMMARIZER_MODEL,
+    model: Optional[str] = None,
     min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION
 ) -> Optional[str]:
     """
@@ -541,7 +563,7 @@ async def process_content_with_llm(
 async def _call_summarizer_llm(
     content: str, 
     context_str: str, 
-    model: str, 
+    model: Optional[str], 
     max_tokens: int = 20000,
     is_chunk: bool = False,
     chunk_info: str = ""
@@ -607,13 +629,13 @@ Create a markdown summary that captures all key information in a well-organized,
 
     for attempt in range(max_retries):
         try:
-            if _aux_async_client is None:
+            aux_client, effective_model, extra_body = _resolve_web_extract_auxiliary(model)
+            if aux_client is None or not effective_model:
                 logger.warning("No auxiliary model available for web content processing")
                 return None
-            from agent.auxiliary_client import get_auxiliary_extra_body, auxiliary_max_tokens_param
-            extra_body = get_auxiliary_extra_body()
-            response = await _aux_async_client.chat.completions.create(
-                model=model,
+            from agent.auxiliary_client import auxiliary_max_tokens_param
+            response = await aux_client.chat.completions.create(
+                model=effective_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -639,7 +661,7 @@ Create a markdown summary that captures all key information in a well-organized,
 async def _process_large_content_chunked(
     content: str, 
     context_str: str, 
-    model: str, 
+    model: Optional[str], 
     chunk_size: int,
     max_output_size: int
 ) -> Optional[str]:
@@ -726,17 +748,17 @@ Synthesize these into ONE cohesive, comprehensive summary that:
 Create a single, unified markdown summary."""
 
     try:
-        if _aux_async_client is None:
+        aux_client, effective_model, extra_body = _resolve_web_extract_auxiliary(model)
+        if aux_client is None or not effective_model:
             logger.warning("No auxiliary model for synthesis, concatenating summaries")
             fallback = "\n\n".join(summaries)
             if len(fallback) > max_output_size:
                 fallback = fallback[:max_output_size] + "\n\n[... truncated ...]"
             return fallback
 
-        from agent.auxiliary_client import get_auxiliary_extra_body, auxiliary_max_tokens_param
-        extra_body = get_auxiliary_extra_body()
-        response = await _aux_async_client.chat.completions.create(
-            model=model,
+        from agent.auxiliary_client import auxiliary_max_tokens_param
+        response = await aux_client.chat.completions.create(
+            model=effective_model,
             messages=[
                 {"role": "system", "content": "You synthesize multiple summaries into one cohesive, comprehensive summary. Be thorough but concise."},
                 {"role": "user", "content": synthesis_prompt}
@@ -1001,7 +1023,7 @@ async def web_extract_tool(
     urls: List[str], 
     format: str = None, 
     use_llm_processing: bool = True,
-    model: str = DEFAULT_SUMMARIZER_MODEL,
+    model: Optional[str] = None,
     min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION
 ) -> str:
     """
@@ -1014,7 +1036,7 @@ async def web_extract_tool(
         urls (List[str]): List of URLs to extract content from
         format (str): Desired output format ("markdown" or "html", optional)
         use_llm_processing (bool): Whether to process content with LLM for summarization (default: True)
-        model (str): The model to use for LLM processing (default: google/gemini-3-flash-preview)
+        model (Optional[str]): The model to use for LLM processing (defaults to current auxiliary backend model)
         min_length (int): Minimum content length to trigger LLM processing (default: 5000)
     
     Returns:
@@ -1173,9 +1195,11 @@ async def web_extract_tool(
         
         debug_call_data["pages_extracted"] = pages_extracted
         debug_call_data["original_response_size"] = len(json.dumps(response))
+        effective_model = model or _get_default_summarizer_model()
+        auxiliary_available = check_auxiliary_model()
         
         # Process each result with LLM if enabled
-        if use_llm_processing and _aux_async_client is not None:
+        if use_llm_processing and auxiliary_available:
             logger.info("Processing extracted content with LLM (parallel)...")
             debug_call_data["processing_applied"].append("llm_processing")
             
@@ -1193,7 +1217,7 @@ async def web_extract_tool(
                 
                 # Process content with LLM
                 processed = await process_content_with_llm(
-                    raw_content, url, title, model, min_length
+                    raw_content, url, title, effective_model, min_length
                 )
                 
                 if processed:
@@ -1209,7 +1233,7 @@ async def web_extract_tool(
                         "original_size": original_size,
                         "processed_size": processed_size,
                         "compression_ratio": compression_ratio,
-                        "model_used": model
+                        "model_used": effective_model
                     }
                     return result, metrics, "processed"
                 else:
@@ -1241,7 +1265,7 @@ async def web_extract_tool(
                 else:
                     logger.warning("%s (no content to process)", url)
         else:
-            if use_llm_processing and _aux_async_client is None:
+            if use_llm_processing and not auxiliary_available:
                 logger.warning("LLM processing requested but no auxiliary model available, returning raw content")
                 debug_call_data["processing_applied"].append("llm_processing_unavailable")
             # Print summary of extracted pages for debugging (original behavior)
@@ -1298,7 +1322,7 @@ async def web_crawl_tool(
     instructions: str = None, 
     depth: str = "basic", 
     use_llm_processing: bool = True,
-    model: str = DEFAULT_SUMMARIZER_MODEL,
+    model: Optional[str] = None,
     min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION
 ) -> str:
     """
@@ -1312,7 +1336,7 @@ async def web_crawl_tool(
         instructions (str): Instructions for what to crawl/extract using LLM intelligence (optional)
         depth (str): Depth of extraction ("basic" or "advanced", default: "basic")
         use_llm_processing (bool): Whether to process content with LLM for summarization (default: True)
-        model (str): The model to use for LLM processing (default: google/gemini-3-flash-preview)
+        model (Optional[str]): The model to use for LLM processing (defaults to current auxiliary backend model)
         min_length (int): Minimum content length to trigger LLM processing (default: 5000)
     
     Returns:
@@ -1342,6 +1366,8 @@ async def web_crawl_tool(
     }
     
     try:
+        effective_model = model or _get_default_summarizer_model()
+        auxiliary_available = check_auxiliary_model()
         backend = _get_backend()
 
         # Tavily supports crawl via its /crawl endpoint
@@ -1386,7 +1412,7 @@ async def web_crawl_tool(
             debug_call_data["original_response_size"] = len(json.dumps(response))
 
             # Process each result with LLM if enabled
-            if use_llm_processing and _aux_async_client is not None:
+            if use_llm_processing and auxiliary_available:
                 logger.info("Processing crawled content with LLM (parallel)...")
                 debug_call_data["processing_applied"].append("llm_processing")
 
@@ -1397,12 +1423,12 @@ async def web_crawl_tool(
                     if not content:
                         return result, None, "no_content"
                     original_size = len(content)
-                    processed = await process_content_with_llm(content, page_url, title, model, min_length)
+                    processed = await process_content_with_llm(content, page_url, title, effective_model, min_length)
                     if processed:
                         result['raw_content'] = content
                         result['content'] = processed
                         metrics = {"url": page_url, "original_size": original_size, "processed_size": len(processed),
-                                   "compression_ratio": len(processed) / original_size if original_size else 1.0, "model_used": model}
+                                   "compression_ratio": len(processed) / original_size if original_size else 1.0, "model_used": effective_model}
                         return result, metrics, "processed"
                     metrics = {"url": page_url, "original_size": original_size, "processed_size": original_size,
                                "compression_ratio": 1.0, "model_used": None, "reason": "content_too_short"}
@@ -1415,7 +1441,7 @@ async def web_crawl_tool(
                         debug_call_data["compression_metrics"].append(metrics)
                         debug_call_data["pages_processed_with_llm"] += 1
 
-            if use_llm_processing and _aux_async_client is None:
+            if use_llm_processing and not auxiliary_available:
                 logger.warning("LLM processing requested but no auxiliary model available, returning raw content")
                 debug_call_data["processing_applied"].append("llm_processing_unavailable")
 
@@ -1594,7 +1620,7 @@ async def web_crawl_tool(
         debug_call_data["original_response_size"] = len(json.dumps(response))
         
         # Process each result with LLM if enabled
-        if use_llm_processing and _aux_async_client is not None:
+        if use_llm_processing and auxiliary_available:
             logger.info("Processing crawled content with LLM (parallel)...")
             debug_call_data["processing_applied"].append("llm_processing")
             
@@ -1612,7 +1638,7 @@ async def web_crawl_tool(
                 
                 # Process content with LLM
                 processed = await process_content_with_llm(
-                    content, page_url, title, model, min_length
+                    content, page_url, title, effective_model, min_length
                 )
                 
                 if processed:
@@ -1628,7 +1654,7 @@ async def web_crawl_tool(
                         "original_size": original_size,
                         "processed_size": processed_size,
                         "compression_ratio": compression_ratio,
-                        "model_used": model
+                        "model_used": effective_model
                     }
                     return result, metrics, "processed"
                 else:
@@ -1660,7 +1686,7 @@ async def web_crawl_tool(
                 else:
                     logger.warning("%s (no content to process)", page_url)
         else:
-            if use_llm_processing and _aux_async_client is None:
+            if use_llm_processing and not auxiliary_available:
                 logger.warning("LLM processing requested but no auxiliary model available, returning raw content")
                 debug_call_data["processing_applied"].append("llm_processing_unavailable")
             # Print summary of crawled pages for debugging (original behavior)
@@ -1733,7 +1759,8 @@ def check_web_api_key() -> bool:
 
 def check_auxiliary_model() -> bool:
     """Check if an auxiliary text model is available for LLM content processing."""
-    return _aux_async_client is not None
+    client, _, _ = _resolve_web_extract_auxiliary()
+    return client is not None
 
 
 def get_debug_session_info() -> Dict[str, Any]:
@@ -1754,6 +1781,7 @@ if __name__ == "__main__":
     firecrawl_key_available = bool(os.getenv("FIRECRAWL_API_KEY", "").strip())
     firecrawl_url_available = bool(os.getenv("FIRECRAWL_API_URL", "").strip())
     nous_available = check_auxiliary_model()
+    default_summarizer_model = _get_default_summarizer_model()
 
     if web_available:
         backend = _get_backend()
@@ -1784,7 +1812,7 @@ if __name__ == "__main__":
         print("Set OPENROUTER_API_KEY, configure Nous Portal, or set OPENAI_BASE_URL + OPENAI_API_KEY")
         print("⚠️  Without an auxiliary model, LLM content processing will be disabled")
     else:
-        print(f"✅ Auxiliary model available: {DEFAULT_SUMMARIZER_MODEL}")
+        print(f"✅ Auxiliary model available: {default_summarizer_model}")
 
     if not web_available:
         exit(1)
@@ -1792,7 +1820,7 @@ if __name__ == "__main__":
     print("🛠️  Web tools ready for use!")
     
     if nous_available:
-        print(f"🧠 LLM content processing available with {DEFAULT_SUMMARIZER_MODEL}")
+        print(f"🧠 LLM content processing available with {default_summarizer_model}")
         print(f"   Default min length for processing: {DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION} chars")
     
     # Show debug mode status
