@@ -106,7 +106,9 @@ class SmsAdapter(BasePlatformAdapter):
         await self._runner.setup()
         site = web.TCPSite(self._runner, "0.0.0.0", self._webhook_port)
         await site.start()
-        self._http_session = aiohttp.ClientSession()
+        self._http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
         self._running = True
 
         logger.info(
