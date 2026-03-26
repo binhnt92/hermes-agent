@@ -122,6 +122,30 @@ def test_managed_modal_execute_polls_until_completed(monkeypatch):
     assert any(call[0] == "POST" and call[1].endswith("/execs") for call in calls)
 
 
+def test_managed_modal_create_sends_a_stable_idempotency_key(monkeypatch):
+    _install_fake_tools_package()
+    managed_modal = _load_tool_module("tools.environments.managed_modal", "environments/managed_modal.py")
+
+    create_headers = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        if method == "POST" and url.endswith("/v1/sandboxes"):
+            create_headers.append(headers or {})
+            return _FakeResponse(200, {"id": "sandbox-1"})
+        if method == "POST" and url.endswith("/terminate"):
+            return _FakeResponse(200, {"status": "terminated"})
+        raise AssertionError(f"Unexpected request: {method} {url}")
+
+    monkeypatch.setattr(managed_modal.requests, "request", fake_request)
+
+    env = managed_modal.ManagedModalEnvironment(image="python:3.11")
+    env.cleanup()
+
+    assert len(create_headers) == 1
+    assert isinstance(create_headers[0].get("x-idempotency-key"), str)
+    assert create_headers[0]["x-idempotency-key"]
+
+
 def test_managed_modal_execute_cancels_on_interrupt(monkeypatch):
     interrupt_event = _install_fake_tools_package()
     managed_modal = _load_tool_module("tools.environments.managed_modal", "environments/managed_modal.py")

@@ -120,6 +120,8 @@ def test_managed_fal_submit_uses_gateway_origin_and_nous_token(monkeypatch):
         "tools.image_generation_tool",
         "image_generation_tool.py",
     )
+    monkeypatch.setattr(image_generation_tool.uuid, "uuid4", lambda: "fal-submit-123")
+    
     image_generation_tool._submit_fal_request(
         "fal-ai/flux-2-pro",
         {"prompt": "test prompt", "num_images": 1},
@@ -135,7 +137,7 @@ def test_managed_fal_submit_uses_gateway_origin_and_nous_token(monkeypatch):
     assert sys.modules["fal_client"].client.QUEUE_RUN_URL is None
     assert sys.modules["fal_client"].client.QUEUE_URL_FORMAT == "https://queue.fal.run/"
     assert sys.modules["fal_client"].auth.FAL_QUEUE_RUN_HOST == "queue.fal.run"
-    assert captured["headers"] is None
+    assert captured["headers"] == {"x-idempotency-key": "fal-submit-123"}
 
 
 def test_openai_tts_uses_managed_audio_gateway_when_direct_key_absent(monkeypatch, tmp_path):
@@ -147,12 +149,14 @@ def test_openai_tts_uses_managed_audio_gateway_when_direct_key_absent(monkeypatc
     monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "nous-token")
 
     tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    monkeypatch.setattr(tts_tool.uuid, "uuid4", lambda: "tts-call-123")
     output_path = tmp_path / "speech.mp3"
     tts_tool._generate_openai_tts("hello world", str(output_path), {"openai": {}})
 
     assert captured["api_key"] == "nous-token"
     assert captured["base_url"] == "https://openai-audio-gateway.nousresearch.com/v1"
     assert captured["speech_kwargs"]["model"] == "gpt-4o-mini-tts"
+    assert captured["speech_kwargs"]["extra_headers"] == {"x-idempotency-key": "tts-call-123"}
     assert captured["stream_to_file"] == str(output_path)
 
 

@@ -53,6 +53,7 @@ class ManagedModalEnvironment(BaseEnvironment):
         self._persistent = persistent_filesystem
         self._image = image
         self._sandbox_kwargs = dict(modal_sandbox_kwargs or {})
+        self._create_idempotency_key = str(uuid.uuid4())
         self._sandbox_id = self._create_sandbox()
 
     def execute(self, command: str, cwd: str = "", *,
@@ -212,6 +213,9 @@ class ManagedModalEnvironment(BaseEnvironment):
             "/v1/sandboxes",
             json=create_payload,
             timeout=60,
+            extra_headers={
+                "x-idempotency-key": self._create_idempotency_key,
+            },
         )
         if response.status_code >= 400:
             raise RuntimeError(self._format_error("Managed Modal create failed", response))
@@ -224,14 +228,19 @@ class ManagedModalEnvironment(BaseEnvironment):
 
     def _request(self, method: str, path: str, *,
                  json: Dict[str, Any] | None = None,
-                 timeout: int = 30) -> requests.Response:
+                 timeout: int = 30,
+                 extra_headers: Dict[str, str] | None = None) -> requests.Response:
+        headers = {
+            "Authorization": f"Bearer {self._nous_user_token}",
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
         return requests.request(
             method,
             f"{self._gateway_origin}{path}",
-            headers={
-                "Authorization": f"Bearer {self._nous_user_token}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json=json,
             timeout=timeout,
         )

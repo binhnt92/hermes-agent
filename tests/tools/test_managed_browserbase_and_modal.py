@@ -111,6 +111,193 @@ def test_browserbase_managed_gateway_disables_local_mode_without_direct_creds():
     assert local_mode is False
 
 
+def test_browserbase_managed_gateway_adds_idempotency_key_and_persists_external_call_id():
+    _install_fake_tools_package()
+    env = os.environ.copy()
+    env.pop("BROWSERBASE_API_KEY", None)
+    env.pop("BROWSERBASE_PROJECT_ID", None)
+    env.update({
+        "TOOL_GATEWAY_USER_TOKEN": "nous-token",
+        "BROWSERBASE_GATEWAY_URL": "http://127.0.0.1:3009",
+    })
+
+    class _Response:
+        status_code = 200
+        ok = True
+        text = ""
+        headers = {"x-external-call-id": "call-browserbase-1"}
+
+        def json(self):
+            return {
+                "id": "bb_local_session_1",
+                "connectUrl": "wss://connect.browserbase.example/session",
+            }
+
+    with patch.dict(os.environ, env, clear=True):
+        browserbase_module = _load_tool_module(
+            "tools.browser_providers.browserbase",
+            "browser_providers/browserbase.py",
+        )
+
+        with patch.object(browserbase_module.requests, "post", return_value=_Response()) as post:
+            provider = browserbase_module.BrowserbaseProvider()
+            session = provider.create_session("task-browserbase-managed")
+
+    sent_headers = post.call_args.kwargs["headers"]
+    assert sent_headers["X-BB-API-Key"] == "nous-token"
+    assert sent_headers["X-Idempotency-Key"].startswith("browserbase-session-create:")
+    assert session["external_call_id"] == "call-browserbase-1"
+
+
+def test_browserbase_managed_gateway_reuses_pending_idempotency_key_after_timeout():
+    _install_fake_tools_package()
+    env = os.environ.copy()
+    env.pop("BROWSERBASE_API_KEY", None)
+    env.pop("BROWSERBASE_PROJECT_ID", None)
+    env.update({
+        "TOOL_GATEWAY_USER_TOKEN": "nous-token",
+        "BROWSERBASE_GATEWAY_URL": "http://127.0.0.1:3009",
+    })
+
+    class _Response:
+        status_code = 200
+        ok = True
+        text = ""
+        headers = {"x-external-call-id": "call-browserbase-2"}
+
+        def json(self):
+            return {
+                "id": "bb_local_session_2",
+                "connectUrl": "wss://connect.browserbase.example/session2",
+            }
+
+    with patch.dict(os.environ, env, clear=True):
+        browserbase_module = _load_tool_module(
+            "tools.browser_providers.browserbase",
+            "browser_providers/browserbase.py",
+        )
+        provider = browserbase_module.BrowserbaseProvider()
+        timeout = browserbase_module.requests.Timeout("timed out")
+
+        with patch.object(
+            browserbase_module.requests,
+            "post",
+            side_effect=[timeout, _Response()],
+        ) as post:
+            try:
+                provider.create_session("task-browserbase-timeout")
+            except browserbase_module.requests.Timeout:
+                pass
+            else:
+                raise AssertionError("Expected Browserbase create_session to propagate timeout")
+
+            provider.create_session("task-browserbase-timeout")
+
+    first_headers = post.call_args_list[0].kwargs["headers"]
+    second_headers = post.call_args_list[1].kwargs["headers"]
+    assert first_headers["X-Idempotency-Key"] == second_headers["X-Idempotency-Key"]
+
+
+def test_browserbase_managed_gateway_preserves_pending_idempotency_key_for_in_progress_conflicts():
+    _install_fake_tools_package()
+    env = os.environ.copy()
+    env.pop("BROWSERBASE_API_KEY", None)
+    env.pop("BROWSERBASE_PROJECT_ID", None)
+    env.update({
+        "TOOL_GATEWAY_USER_TOKEN": "nous-token",
+        "BROWSERBASE_GATEWAY_URL": "http://127.0.0.1:3009",
+    })
+
+    class _ConflictResponse:
+        status_code = 409
+        ok = False
+        text = '{"error":{"code":"CONFLICT","message":"Managed Browserbase session creation is already in progress for this idempotency key"}}'
+        headers = {}
+
+        def json(self):
+            return {
+                "error": {
+                    "code": "CONFLICT",
+                    "message": "Managed Browserbase session creation is already in progress for this idempotency key",
+                }
+            }
+
+    class _SuccessResponse:
+        status_code = 200
+        ok = True
+        text = ""
+        headers = {"x-external-call-id": "call-browserbase-4"}
+
+        def json(self):
+            return {
+                "id": "bb_local_session_4",
+                "connectUrl": "wss://connect.browserbase.example/session4",
+            }
+
+    with patch.dict(os.environ, env, clear=True):
+        browserbase_module = _load_tool_module(
+            "tools.browser_providers.browserbase",
+            "browser_providers/browserbase.py",
+        )
+        provider = browserbase_module.BrowserbaseProvider()
+
+        with patch.object(
+            browserbase_module.requests,
+            "post",
+            side_effect=[_ConflictResponse(), _SuccessResponse()],
+        ) as post:
+            try:
+                provider.create_session("task-browserbase-conflict")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Expected Browserbase create_session to propagate the in-progress conflict")
+
+            provider.create_session("task-browserbase-conflict")
+
+    first_headers = post.call_args_list[0].kwargs["headers"]
+    second_headers = post.call_args_list[1].kwargs["headers"]
+    assert first_headers["X-Idempotency-Key"] == second_headers["X-Idempotency-Key"]
+
+
+def test_browserbase_managed_gateway_uses_new_idempotency_key_for_a_new_session_after_success():
+    _install_fake_tools_package()
+    env = os.environ.copy()
+    env.pop("BROWSERBASE_API_KEY", None)
+    env.pop("BROWSERBASE_PROJECT_ID", None)
+    env.update({
+        "TOOL_GATEWAY_USER_TOKEN": "nous-token",
+        "BROWSERBASE_GATEWAY_URL": "http://127.0.0.1:3009",
+    })
+
+    class _Response:
+        status_code = 200
+        ok = True
+        text = ""
+        headers = {"x-external-call-id": "call-browserbase-3"}
+
+        def json(self):
+            return {
+                "id": "bb_local_session_3",
+                "connectUrl": "wss://connect.browserbase.example/session3",
+            }
+
+    with patch.dict(os.environ, env, clear=True):
+        browserbase_module = _load_tool_module(
+            "tools.browser_providers.browserbase",
+            "browser_providers/browserbase.py",
+        )
+        provider = browserbase_module.BrowserbaseProvider()
+
+        with patch.object(browserbase_module.requests, "post", side_effect=[_Response(), _Response()]) as post:
+            provider.create_session("task-browserbase-new")
+            provider.create_session("task-browserbase-new")
+
+    first_headers = post.call_args_list[0].kwargs["headers"]
+    second_headers = post.call_args_list[1].kwargs["headers"]
+    assert first_headers["X-Idempotency-Key"] != second_headers["X-Idempotency-Key"]
+
+
 def test_terminal_tool_prefers_managed_modal_when_gateway_ready_and_no_direct_creds():
     _install_fake_tools_package()
     env = os.environ.copy()

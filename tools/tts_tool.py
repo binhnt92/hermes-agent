@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Callable, Dict, Any, Optional
@@ -255,6 +256,7 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         voice=voice,
         input=text,
         response_format=response_format,
+        extra_headers={"x-idempotency-key": str(uuid.uuid4())},
     )
 
     response.stream_to_file(output_path)

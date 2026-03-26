@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import datetime
+import uuid
 from contextlib import contextmanager
 from typing import Dict, Any, Optional, Union
 from urllib.parse import urlparse
@@ -138,9 +139,10 @@ def _override_fal_queue_host(queue_run_origin: Optional[str]):
 
 def _submit_fal_request(model: str, arguments: Dict[str, Any]):
     """Submit a FAL request using direct credentials or the managed queue gateway."""
+    request_headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_gateway()
     if managed_gateway is None:
-        return fal_client.submit(model, arguments=arguments)
+        return fal_client.submit(model, arguments=arguments, headers=request_headers)
 
     sync_client_class = getattr(fal_client, "SyncClient", None)
     if sync_client_class is None:
@@ -151,6 +153,7 @@ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
         return managed_client.submit(
             model,
             arguments=arguments,
+            headers=request_headers,
         )
 
 
