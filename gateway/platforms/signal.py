@@ -230,9 +230,13 @@ class SignalAdapter(BasePlatformAdapter):
             resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=10.0)
             if resp.status_code != 200:
                 logger.error("Signal: health check failed (status %d)", resp.status_code)
+                await self.client.aclose()
+                self.client = None
                 return False
         except Exception as e:
             logger.error("Signal: cannot reach signal-cli at %s: %s", self.http_url, e)
+            await self.client.aclose()
+            self.client = None
             return False
 
         self._running = True
