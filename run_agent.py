@@ -1263,6 +1263,11 @@ class AIAgent:
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
 
+        # Fallback provider state — must reset so each new session starts on
+        # the primary model, not stuck on a fallback from a previous session.
+        self._fallback_index = 0
+        self._fallback_activated = False
+
         # Context compressor internal counters (if present)
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.last_prompt_tokens = 0
