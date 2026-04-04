@@ -962,11 +962,27 @@ class SessionStore:
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
         
-        # JSONL: overwrite the file
+        # JSONL: overwrite atomically (write to temp file + os.replace)
+        # so a crash mid-write never leaves a truncated transcript.
         transcript_path = self.get_transcript_path(session_id)
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        import tempfile
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(transcript_path.parent), suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                for msg in messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, str(transcript_path))
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""

@@ -8,6 +8,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -72,11 +73,23 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     }
 
     try:
+        import tempfile
         DIRECTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(DIRECTORY_PATH, "w", encoding="utf-8") as f:
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(DIRECTORY_PATH.parent), suffix=".tmp"
+        )
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             json.dump(directory, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, str(DIRECTORY_PATH))
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except (OSError, UnboundLocalError):
+            pass
 
     return directory
 
