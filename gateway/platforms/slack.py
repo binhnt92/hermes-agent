@@ -189,6 +189,14 @@ class SlackAdapter(BasePlatformAdapter):
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[Slack] Connection failed: %s", e, exc_info=True)
+            # Release the platform lock so the next gateway start isn't blocked.
+            if self._token_lock_identity:
+                try:
+                    from gateway.status import release_scoped_lock
+                    release_scoped_lock('slack-app-token', self._token_lock_identity)
+                except Exception:
+                    pass
+                self._token_lock_identity = None
             return False
 
     async def disconnect(self) -> None:

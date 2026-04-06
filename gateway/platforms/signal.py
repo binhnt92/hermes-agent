@@ -230,9 +230,15 @@ class SignalAdapter(BasePlatformAdapter):
             resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=10.0)
             if resp.status_code != 200:
                 logger.error("Signal: health check failed (status %d)", resp.status_code)
+                await self.client.aclose()
+                self.client = None
+                self._release_phone_lock()
                 return False
         except Exception as e:
             logger.error("Signal: cannot reach signal-cli at %s: %s", self.http_url, e)
+            await self.client.aclose()
+            self.client = None
+            self._release_phone_lock()
             return False
 
         self._running = True
@@ -242,6 +248,16 @@ class SignalAdapter(BasePlatformAdapter):
 
         logger.info("Signal: connected to %s", self.http_url)
         return True
+
+    def _release_phone_lock(self) -> None:
+        """Release the Signal phone scoped lock if held."""
+        if self._phone_lock_identity:
+            try:
+                from gateway.status import release_scoped_lock
+                release_scoped_lock("signal-phone", self._phone_lock_identity)
+            except Exception as e:
+                logger.warning("Signal: Error releasing phone lock: %s", e, exc_info=True)
+            self._phone_lock_identity = None
 
     async def disconnect(self) -> None:
         """Stop SSE listener and clean up."""
@@ -270,13 +286,7 @@ class SignalAdapter(BasePlatformAdapter):
             await self.client.aclose()
             self.client = None
 
-        if self._phone_lock_identity:
-            try:
-                from gateway.status import release_scoped_lock
-                release_scoped_lock("signal-phone", self._phone_lock_identity)
-            except Exception as e:
-                logger.warning("Signal: Error releasing phone lock: %s", e, exc_info=True)
-            self._phone_lock_identity = None
+        self._release_phone_lock()
 
         logger.info("Signal: disconnected")
 
