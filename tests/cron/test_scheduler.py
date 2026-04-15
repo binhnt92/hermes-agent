@@ -1,5 +1,6 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -495,6 +496,109 @@ class TestDeliverResultWrapping:
         text_sent = adapter.send.call_args[0][1]
         assert "MEDIA:" not in text_sent
         assert "Report" in text_sent
+
+    def test_live_adapter_text_timeout_does_not_fallback_to_standalone(self):
+        """Timeouts are ambiguous for non-idempotent sends, so cron must not retry
+        them via the standalone path and risk duplicate delivery."""
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        future = MagicMock()
+        future.result.side_effect = concurrent.futures.TimeoutError()
+        future.done.return_value = False
+        future.cancel.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return future
+
+        job = {
+            "id": "timeout-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "555"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            result = _deliver_result(
+                job,
+                "Report body",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "timed out" in result
+        assert "not falling back" in result
+        assert future.cancel.called
+        send_mock.assert_not_called()
+
+    def test_live_adapter_media_timeout_does_not_fallback_to_standalone(self):
+        """A timed-out media send may still complete later, so cron must not
+        retry the whole delivery through the standalone path."""
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_image_file.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        text_future = MagicMock()
+        text_future.result.return_value = MagicMock(success=True)
+        text_future.done.return_value = True
+
+        media_future = MagicMock()
+        media_future.result.side_effect = concurrent.futures.TimeoutError()
+        media_future.done.return_value = False
+        media_future.cancel.return_value = True
+
+        futures = [text_future, media_future]
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return futures.pop(0)
+
+        job = {
+            "id": "media-timeout",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "777"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            result = _deliver_result(
+                job,
+                "Report\nMEDIA:/tmp/chart.png",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "media send failed" in result
+        assert "timed out" in result
+        assert media_future.cancel.called
+        send_mock.assert_not_called()
 
     def test_no_mirror_to_session_call(self):
         """Cron deliveries should NOT mirror into the gateway session."""
@@ -1175,7 +1279,7 @@ class TestSendMediaViaAdapter:
         t = threading.Thread(target=loop.run_forever, daemon=True)
         t.start()
         try:
-            _send_media_via_adapter(adapter, chat_id, media_files, metadata, loop, job)
+            return _send_media_via_adapter(adapter, chat_id, media_files, metadata, loop, job)
         finally:
             loop.call_soon_threadsafe(loop.stop)
             t.join(timeout=5)
@@ -1203,5 +1307,44 @@ class TestSendMediaViaAdapter:
         adapter.send_image_file = AsyncMock()
         media_files = [("/tmp/voice.mp3", False), ("/tmp/photo.jpg", False)]
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
+        adapter.send_voice.assert_called_once()
+        adapter.send_image_file.assert_called_once()
+
+    def test_single_failure_does_not_block_others(self):
+        adapter = MagicMock()
+        adapter.send_voice = AsyncMock(side_effect=RuntimeError("network error"))
+        adapter.send_image_file = AsyncMock()
+        media_files = [("/tmp/voice.ogg", False), ("/tmp/photo.png", False)]
+        self._run_with_loop(adapter, "123", media_files, None, {"id": "j4"})
+        adapter.send_voice.assert_called_once()
+        adapter.send_image_file.assert_called_once()
+
+    def test_timeout_returns_error_and_continues_other_media(self):
+        adapter = MagicMock()
+        adapter.send_voice = AsyncMock()
+        adapter.send_image_file = AsyncMock()
+        loop = MagicMock()
+
+        timeout_future = MagicMock()
+        timeout_future.result.side_effect = concurrent.futures.TimeoutError()
+        timeout_future.done.return_value = False
+        timeout_future.cancel.return_value = True
+
+        ok_future = MagicMock()
+        ok_future.result.return_value = MagicMock(success=True)
+        ok_future.done.return_value = True
+
+        futures = [timeout_future, ok_future]
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return futures.pop(0)
+
+        media_files = [("/tmp/voice.ogg", False), ("/tmp/photo.png", False)]
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _send_media_via_adapter(adapter, "123", media_files, None, loop, {"id": "j5"})
+
+        assert result is not None
+        assert "timed out" in result
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()

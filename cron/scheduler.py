@@ -166,7 +166,35 @@ _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 
 
-def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: dict | None, loop, job: dict) -> None:
+def _cancel_inflight_future(future: concurrent.futures.Future, *, wait_timeout: float = 1.0) -> bool:
+    """Best-effort cancellation for a thread-safe future.
+
+    Returns True when the future is already finished or cancellation is
+    observed promptly.  False means the work may still be running, so callers
+    must not retry the same non-idempotent send.
+    """
+    if future.done():
+        return True
+    future.cancel()
+    try:
+        future.result(timeout=wait_timeout)
+    except concurrent.futures.CancelledError:
+        return True
+    except concurrent.futures.TimeoutError:
+        return False
+    except Exception:
+        return future.done()
+    return future.cancelled() or future.done()
+
+
+def _send_media_via_adapter(
+    adapter,
+    chat_id: str,
+    media_files: list,
+    metadata: dict | None,
+    loop,
+    job: dict,
+) -> Optional[str]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -175,6 +203,7 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: 
     """
     from pathlib import Path
 
+    errors: list[str] = []
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
@@ -188,14 +217,30 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: 
                 coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
             future = asyncio.run_coroutine_threadsafe(coro, loop)
-            result = future.result(timeout=30)
-            if result and not getattr(result, "success", True):
-                logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+            try:
+                result = future.result(timeout=30)
+            except concurrent.futures.TimeoutError:
+                cancelled = _cancel_inflight_future(future)
+                detail = (
+                    "timed out and may still be in flight"
+                    if not cancelled
+                    else "timed out; cancelled to avoid duplicate delivery"
                 )
+                msg = f"media send failed for {media_path}: {detail}"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
+                continue
+            if result and not getattr(result, "success", True):
+                msg = f"media send failed for {media_path}: {getattr(result, 'error', 'unknown')}"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
         except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            msg = f"failed to send media {media_path}: {e}"
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            errors.append(msg)
+    if errors:
+        return "; ".join(errors)
+    return None
 
 
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
@@ -318,7 +363,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
                     loop,
                 )
-                send_result = future.result(timeout=60)
+                try:
+                    send_result = future.result(timeout=60)
+                except concurrent.futures.TimeoutError:
+                    cancelled = _cancel_inflight_future(future)
+                    msg = (
+                        f"live adapter delivery to {platform_name}:{chat_id} timed out "
+                        f"and {'may still be in flight' if not cancelled else 'was cancelled'}; "
+                        "not falling back to avoid duplicate delivery"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    return msg
                 if send_result and not getattr(send_result, "success", True):
                     err = getattr(send_result, "error", "unknown")
                     logger.warning(
@@ -329,7 +384,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
             # Send extracted media files as native attachments via the live adapter
             if adapter_ok and media_files:
-                _send_media_via_adapter(runtime_adapter, chat_id, media_files, send_metadata, loop, job)
+                media_error = _send_media_via_adapter(
+                    runtime_adapter,
+                    chat_id,
+                    media_files,
+                    send_metadata,
+                    loop,
+                    job,
+                )
+                if media_error:
+                    return media_error
 
             if adapter_ok:
                 logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
@@ -350,7 +414,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
         # fresh thread that has no running loop.
         coro.close()
-        import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
             result = future.result(timeout=30)
