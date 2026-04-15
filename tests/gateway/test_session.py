@@ -420,6 +420,40 @@ class TestSessionStoreRewriteTranscript:
         reloaded = store.load_transcript(session_id)
         assert reloaded == []
 
+    def test_rewrite_failure_leaves_existing_jsonl_intact(self, store, monkeypatch):
+        session_id = "test_session_atomic_failure"
+        original_messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        replacement_messages = [
+            {"role": "user", "content": "rewrite me"},
+            {"role": "assistant", "content": "this should not land"},
+        ]
+
+        for msg in original_messages:
+            store.append_to_transcript(session_id, msg)
+
+        transcript_path = store.get_transcript_path(session_id)
+        original_contents = transcript_path.read_text(encoding="utf-8")
+        real_dumps = json.dumps
+        call_count = 0
+
+        def fail_mid_rewrite(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("boom during rewrite")
+            return real_dumps(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.session.json.dumps", fail_mid_rewrite)
+
+        with pytest.raises(RuntimeError, match="boom during rewrite"):
+            store.rewrite_transcript(session_id, replacement_messages)
+
+        assert transcript_path.read_text(encoding="utf-8") == original_contents
+        assert store.load_transcript(session_id) == original_messages
+
 
 class TestLoadTranscriptCorruptLines:
     """Regression: corrupt JSONL lines (e.g. from mid-write crash) must be
